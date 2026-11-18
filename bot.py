@@ -1,15 +1,6 @@
 """
-Bot Scalping v23.4 — BINANCE FUTURES PAPER, DEMO & LIVE EXECUTION ENGINE
+Bot Scalping v23.3 — BINANCE FUTURES PAPER, DEMO & LIVE EXECUTION ENGINE
 ====================================================================
-UPDATES v23.4 (LOSS TIME LIMIT):
-- LOSS TIME LIMIT: kalau posisi terus-menerus MINUS selama LOSS_TIME_LIMIT_SEC (default 1 jam),
-  posisi langsung di-cut (exit reason "LOSS_TIMEOUT").
-- TIMER RESET: kalau di tengah jalan posisi kembali PLUS (harga lewat dari entry ke sisi profit),
-  timer minus di-reset. Kalau nanti minus lagi, hitungan mulai dari 0 lagi.
-  Contoh: INJUSDT minus -2%, lalu naik jadi +3% -> timer reset. Minus lagi -> hitung 1 jam dari awal.
-- Posisi yang PLUS tidak pernah kena time limit (hanya TP/SL yang menutupnya).
-- Bagian lain TIDAK diubah dari v23.3.
-
 UPDATES v23.3 (PAPER TRADING + CUSTOM MARGIN $3 SL):
 - MODE PAPER TRADING: Simulasi eksekusi order lokal secara real-time menggunakan
   data harga & orderbook live Binance tanpa mengirim order ke API (tidak butuh saldo/API key).
@@ -20,7 +11,7 @@ UPDATES v23.3 (PAPER TRADING + CUSTOM MARGIN $3 SL):
       Margin $12 -> TP 2.5 | SL 2.0
       ... dst tanpa batas (ratusan, ribuan) mengikuti pola kelipatan 3.
 - HAPUS SEMUA EXIT BERBASIS WAKTU (MAX_HOLD_SECONDS, stagnant/time-limit exit). Posisi hanya
-  ditutup oleh TP atau SL. (v23.4: ditambah LOSS_TIMEOUT khusus posisi yang minus)
+  ditutup oleh TP atau SL.
 - Harga TP/SL dihitung dari notional asli (qty x harga entry), dan dikompensasi fee (opsional)
   supaya PnL NET yang kena persis sesuai target.
 - Target mingguan tetap = ORDER_USDT (margin).
@@ -122,7 +113,7 @@ ORDER_USDT    = 6.0     # MARGIN per trade. Ubah ke 3.0 untuk menguji aturan khu
 MAX_POSITIONS = 1
 
 # ── LOSS TIME LIMIT (v23.4) ────────────────────────────────────────────────
-# Posisi yang terus-menerus minus selama LOSS_TIME_LIMIT_SEC -> langsung di-cut.
+# Posisi yang terus-menerus minus selama LOSS_TIME_LIMIT_SEC -> di-cut (reason "LOSS_TIMEOUT").
 # Kalau posisi sempat kembali plus, timer minus di-reset ke 0.
 LOSS_TIME_LIMIT_ENABLED = True
 LOSS_TIME_LIMIT_SEC     = 3600.0   # 1 jam
@@ -714,8 +705,6 @@ _stats = {
     "hard_sl": 0, "tp_exit": 0, "time_limit_exit": 0, "loss_timeout": 0, "regime_block": 0,
     "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "absorb_entries": 0,
     "low_vol_veto": 0, "same_side_veto": 0,
-    "scanned": 0, "vr_veto": 0, "adx_veto": 0, "atr_veto": 0, "no_signal": 0,
-    "best_score": 0, "best_sym": "",
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -1115,8 +1104,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "mode": entry_mode,
         "order_id": order_id,
         "entry_fee": entry_fill["fee"] if entry_fill else None,
-        # v23.4: timestamp kapan posisi mulai minus terus-menerus (None = sedang tidak minus)
-        "loss_since": None,
+        "loss_since": None,   # v23.4: kapan mulai minus terus-menerus (None = tidak minus)
     }
 
     with _lock:
@@ -1308,10 +1296,7 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 def monitor_positions():
-    # v23.4: TP / SL + LOSS TIME LIMIT.
-    #  - Posisi PLUS tidak pernah kena time limit (hanya TP/SL).
-    #  - Posisi MINUS terus-menerus >= LOSS_TIME_LIMIT_SEC -> cut ("LOSS_TIMEOUT").
-    #  - Kalau posisi kembali PLUS di tengah jalan, timer minus di-reset ke 0.
+    # v23.3: HANYA TP / SL. Tidak ada lagi exit berbasis waktu (stagnant / max hold).
     for sym in list(live_positions.keys()):
         pos = live_positions.get(sym)
         if pos is None or pos.get("_r") or pos.get("_closing"): continue
@@ -1321,7 +1306,6 @@ def monitor_positions():
 
         side, tp_px, sl_px = pos["side"], pos["tp_price"], pos["sl_price"]
 
-        # ── Cek TP / SL dulu (prioritas utama) ──
         if side == "LONG":
             if px >= tp_px: live_close(sym, "TP", px); continue
             if px <= sl_px: live_close(sym, "SL", px); continue
@@ -1329,27 +1313,19 @@ def monitor_positions():
             if px <= tp_px: live_close(sym, "TP", px); continue
             if px >= sl_px: live_close(sym, "SL", px); continue
 
-        # ── LOSS TIME LIMIT ──
-        if not LOSS_TIME_LIMIT_ENABLED:
-            continue
-
+        # v23.4: LOSS TIME LIMIT (posisi plus tidak pernah kena; timer reset kalau kembali plus)
+        if not LOSS_TIME_LIMIT_ENABLED: continue
         entry = pos["entry"]
         now = time.time()
         in_loss = (px < entry) if side == "LONG" else (px > entry)
-
         if in_loss:
             if pos.get("loss_since") is None:
-                # baru mulai minus -> mulai hitung timer
                 pos["loss_since"] = now
             elif (now - pos["loss_since"]) >= LOSS_TIME_LIMIT_SEC:
-                mins = (now - pos["loss_since"]) / 60.0
-                print(f"\n  ⏱️ [LOSS TIMEOUT] {sym} {side} minus terus-menerus {mins:.0f} menit — CUT @{px:.6g}")
-                live_close(sym, "LOSS_TIMEOUT", px)
-                continue
+                print(f"\n  ⏱️ [LOSS TIMEOUT] {sym} {side} minus terus-menerus {(now - pos['loss_since'])/60:.0f} menit — CUT @{px:.6g}")
+                live_close(sym, "LOSS_TIMEOUT", px); continue
         else:
-            # posisi kembali plus (atau impas) -> RESET timer minus
-            if pos.get("loss_since") is not None:
-                pos["loss_since"] = None
+            pos["loss_since"] = None
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SCANNER THREAD & STRICT FILTERS
@@ -1374,22 +1350,12 @@ def scan_one(sym):
         if px_candle == 0 or np.isnan(atr_val): return None
 
         # ── FILTER 1: Volume & Sideway Guard ─────────────────────────
-        _stats["scanned"] += 1
-        _vr_bad  = vr_val < MIN_VOLUME_RATIO
-        _adx_bad = adx_val < MIN_ADX_TREND
-        _atr_bad = (atr_val / px_candle) < MIN_ATR_PCT
-        if _vr_bad or _adx_bad or _atr_bad:
+        if vr_val < MIN_VOLUME_RATIO or adx_val < MIN_ADX_TREND or (atr_val / px_candle) < MIN_ATR_PCT:
             _stats["low_vol_veto"] += 1
-            if _vr_bad:  _stats["vr_veto"] += 1
-            if _adx_bad: _stats["adx_veto"] += 1
-            if _atr_bad: _stats["atr_veto"] += 1
             return None
 
         orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
         if orig_direction is None or orig_direction not in ("LONG", "SHORT"):
-            _stats["no_signal"] += 1
-            if score > _stats["best_score"]:
-                _stats["best_score"], _stats["best_sym"] = score, sym
             return None
 
         # FIX DEADLOCK INVERTED: saat INVERTED arah eksekusi sudah dikunci (_inverted_forced_side),
@@ -1437,15 +1403,11 @@ def scan_one(sym):
 def scan_batch(syms):
     res = []
     fut = {_executor.submit(scan_one, s): s for s in syms[:BATCH_SIZE]}
-    try:
-        for f in as_completed(fut, timeout=5):
-            try:
-                r = f.result(timeout=1)
-                if r: res.append(r)
-            except Exception as e:
-                _log_err("scan_batch_result", e)
-    except Exception as e:
-        _log_err("scan_batch_timeout", e)
+    for f in as_completed(fut, timeout=5):
+        try:
+            r = f.result(timeout=1)
+            if r: res.append(r)
+        except: pass
     return res
 
 def top_movers(syms, n=30):
@@ -1467,8 +1429,8 @@ def print_inline():
     failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
     acc_mode = _get_acc_mode_str()
     engine_label = "PAPER ENGINE" if PAPER_TRADING else "API ENGINE"
-    print(f"        ┌ [{engine_label} v23.4 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
-    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} LossTO:{_stats['loss_timeout']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
+    print(f"        ┌ [{engine_label} v23.3 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
+    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1484,18 +1446,10 @@ def print_full():
     print(f"\n  {'─'*72}")
     print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD ({acc_mode} | MODE: {mode_str}{forced_str}){failed_str} [{now_wita}]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
-    print(f"    💰 Margin:${ORDER_USDT:.2f} | TP:+{tp_u:.2f}U | SL:-{sl_u:.2f}U per trade | Loss Time Limit:{LOSS_TIME_LIMIT_SEC/60:.0f}m")
+    print(f"    💰 Margin:${ORDER_USDT:.2f} | TP:+{tp_u:.2f}U | SL:-{sl_u:.2f}U per trade")
     print(f"    PnL Net:{pnl:+.5f}U | Weekly PnL:{_weekly_pnl:+.5f}U / Target:${ORDER_USDT:.2f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    🏆 Best Win:{_stats['best']:+.5f}U | 💥 Worst Loss:{_stats['worst']:+.5f}U")
-    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | LossTimeout:{_stats['loss_timeout']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
-
-    # Info timer minus untuk posisi yang sedang terbuka
-    for _sym, _pos in list(live_positions.items()):
-        if _pos.get("_r"): continue
-        ls = _pos.get("loss_since")
-        if ls is not None:
-            elapsed = time.time() - ls
-            print(f"    ⏱️ {_sym} minus selama {elapsed/60:.1f}m / {LOSS_TIME_LIMIT_SEC/60:.0f}m")
+    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
 
     if trade_log:
         print(f"    {'─'*68}\n    📋 Last 5 Trades (Makassar / WITA Timezone):")
@@ -1504,7 +1458,7 @@ def print_full():
             in_t = t.get("in_wita", "--:--:--")
             out_t = t.get("out_wita", "--:--:--")
             mode_lbl = f"[{t.get('mode', 'NORMAL')}]"
-            print(f"        {em} {t['sym']:<12} {t['side']:<5} {mode_lbl:<10} {t['pnl']:+.5f}U (G:{t.get('gross', 0.0):+.4f}{'*' if t.get('est') else ''}) {t['hold']}s — {t['reason']:<12} | In:{in_t} Out:{out_t}")
+            print(f"        {em} {t['sym']:<12} {t['side']:<5} {mode_lbl:<10} {t['pnl']:+.5f}U (G:{t.get('gross', 0.0):+.4f}{'*' if t.get('est') else ''}) {t['hold']}s — {t['reason']:<11} | In:{in_t} Out:{out_t}")
     print(f"  {'─'*72}")
 
 def t_monitor():
@@ -1646,16 +1600,15 @@ def handle_depth_multiplex(msg):
 def run_bot():
     if PAPER_TRADING:
         acc_type_str = "PAPER TRADING (SIMULASI LOKAL - DATA LIVE)"
-        header_title = "💎 BOT SCALPING v23.4 — PAPER TRADING EXECUTION ENGINE"
+        header_title = "💎 BOT SCALPING v23.3 — PAPER TRADING EXECUTION ENGINE"
     elif USE_DEMO_ACCOUNT:
         acc_type_str = "BINANCE FUTURES DEMO (TESTNET)"
-        header_title = "💎 BOT SCALPING v23.4 — LIVE BINANCE API EXECUTION ENGINE"
+        header_title = "💎 BOT SCALPING v23.3 — LIVE BINANCE API EXECUTION ENGINE"
     else:
         acc_type_str = "BINANCE FUTURES REAL MAINNET"
-        header_title = "💎 BOT SCALPING v23.4 — LIVE BINANCE API EXECUTION ENGINE"
+        header_title = "💎 BOT SCALPING v23.3 — LIVE BINANCE API EXECUTION ENGINE"
 
     tp_u, sl_u = tp_sl_usdt()
-    loss_lim_str = f"{LOSS_TIME_LIMIT_SEC/60:.0f} menit" if LOSS_TIME_LIMIT_ENABLED else "OFF"
     print("╔════════════════════════════════════════════════════════════════════╗")
     print(f"║  {header_title:<66}║")
     print(f"║  MODE AKUN: {acc_type_str:<54} ║")
@@ -1663,8 +1616,7 @@ def run_bot():
     print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
     print("║  3. Inverted Lock Engine (SHORT loss -> LONG, LONG loss -> SHORT)  ║")
     print(f"║  4. Target Mingguan = ${ORDER_USDT:.2f} (sama dengan margin) | Reset Senin WITA  ║")
-    print(f"║  5. Margin=${ORDER_USDT:.2f} | TP=+${tp_u:.2f} | SL=-${sl_u:.2f} per trade               ║")
-    print(f"║  6. Loss Time Limit: {loss_lim_str:<13} (timer reset kalau kembali plus)  ║")
+    print(f"║  5. Margin=${ORDER_USDT:.2f} | TP=+${tp_u:.2f} | SL=-${sl_u:.2f} per trade | Tanpa limit waktu ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     
     try:
@@ -1718,10 +1670,6 @@ def run_bot():
         elif (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
         elif slots == 0: print(f"  ✅ Slots Full — Monitoring Posisi Terbuka ({short_acc})")
         else: print(f"  🔍 Slot Kosong — Scanning Signal ({short_acc} | Mode: {mode_str}{forced_str})...")
-        print(f"  🧪 DIAG scanned:{_stats['scanned']} | veto vol:{_stats['vr_veto']} adx:{_stats['adx_veto']} atr:{_stats['atr_veto']} | "
-              f"skor<{MIN_SCORE}:{_stats['no_signal']} (skor tertinggi {_stats['best_score']:.0f} {_stats['best_sym']}) | "
-              f"sameside:{_stats['same_side_veto']} btc:{_stats['btc_breaker_veto']} wall:{_stats['wall_veto']} spoof:{_stats['spoof_veto']}")
-        _stats["best_score"], _stats["best_sym"] = 0, ""
         if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
 
