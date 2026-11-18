@@ -1,10 +1,11 @@
 """
 Bot Scalping v23.3 — BINANCE FUTURES PAPER, DEMO & LIVE EXECUTION ENGINE
 ====================================================================
-UPDATES v23.3 (PAPER TRADING + CUSTOM MARGIN $3 SL + 1H LOSS TIME LIMIT):
-- LOSS HOLD TIME LIMIT (1 JAM): Jika posisi berada dalam kondisi minus selama
-  3600 detik (1 jam) terus-menerus, posisi otomatis di-cut (LOSS_1H_LIMIT).
-  Jika posisi berbalik profit (>= 0) sebelum 1 jam, timer minus otomatis di-reset.
+UPDATES v23.3 (PAPER TRADING + CUSTOM MARGIN $3 SL + 1H MINUS TIME LIMIT):
+- TIME LIMIT SAAT MINUS (MINUS_HOLD_LIMIT_SEC = 3600):
+  Jika posisi berada di area minus (floating loss) terus-menerus selama 1 jam (3600s),
+  posisi langsung di-cut. Jika harga kembali menyentuh area profit (+), timer minus
+  otomatis di-reset dari 0.
 - MODE PAPER TRADING: Simulasi eksekusi order lokal secara real-time menggunakan
   data harga & orderbook live Binance tanpa mengirim order ke API (tidak butuh saldo/API key).
 - ATURAN KHUSUS MARGIN $3:
@@ -109,10 +110,9 @@ twm = _create_twm()
 #  CONFIGURATION & INSTITUTIONAL PARAMETERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-LEVERAGE            = 20
-ORDER_USDT          = 6.0     # MARGIN per trade. Ubah ke 3.0 untuk menguji aturan khusus Margin $3 (TP 1 | SL 1).
-MAX_POSITIONS       = 1
-LOSS_HOLD_LIMIT_SEC = 3600    # 1 jam (3600 detik) batas waktu hold saat kondisi minus (otomatis reset jika berbalik profit)
+LEVERAGE      = 20
+ORDER_USDT    = 6.0     # MARGIN per trade. Ubah ke 3.0 untuk menguji aturan khusus Margin $3 (TP 1 | SL 1).
+MAX_POSITIONS = 1
 
 # Strict Volume & Sideway Filters
 MIN_VOLUME_RATIO = 0.85
@@ -149,7 +149,8 @@ TP_SL_GAP    = 0.5   # SL lebih kecil 0.5 dari TP (untuk margin 6 ke atas)
 FEE_RATE          = 0.0004   # taker fee per sisi (0.04%) — dipakai untuk kompensasi fee & simulasi paper
 FEE_COMPENSATION  = True     # True = PnL NET (setelah fee) yang kena target TP/SL | False = PnL GROSS
 
-COIN_COOLDOWN_SEC = 900    # 15 menit cooldown setelah exit per koin
+COIN_COOLDOWN_SEC    = 900    # 15 menit cooldown setelah exit per koin
+MINUS_HOLD_LIMIT_SEC = 3600   # 1 jam (3600 detik) batas waktu hold saat minus; reset otomatis jika kembali profit
 
 def tp_sl_usdt(margin: float = None) -> Tuple[float, float]:
     """
@@ -1085,6 +1086,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "qty": q_val,
         "open_time": open_ts,
         "open_time_wita": datetime.fromtimestamp(open_ts, tz=WITA_TZ).strftime("%H:%M:%S"),
+        "minus_since": None,  # Timestamp pertama kali posisi masuk minus; otomatis reset ke None saat profit
         "score": score,
         "sigs": sigs,
         "atr": atr,
@@ -1100,7 +1102,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "mode": entry_mode,
         "order_id": order_id,
         "entry_fee": entry_fill["fee"] if entry_fill else None,
-        "loss_start_ts": None,  # Timer mulai dihitung saat posisi masuk area minus (< 0), reset ke None jika >= 0
     }
 
     with _lock:
@@ -1274,7 +1275,7 @@ def live_close(sym, reason, price=None):
 
     if reason == "SL": _stats["hard_sl"] += 1
     elif reason == "TP": _stats["tp_exit"] += 1
-    elif reason == "LOSS_1H_LIMIT": _stats["time_limit_exit"] += 1
+    elif reason == "MINUS_1H": _stats["time_limit_exit"] += 1
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7),
@@ -1292,7 +1293,7 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 def monitor_positions():
-    # TP / SL + Time Limit 1 Jam khusus ketika posisi sedang minus (otomatis reset jika berbalik profit)
+    # TP / SL + Time Limit 1 Jam khusus saat posisi sedang minus (reset otomatis jika kembali profit)
     now = time.time()
     for sym in list(live_positions.keys()):
         pos = live_positions.get(sym)
@@ -1303,28 +1304,29 @@ def monitor_positions():
 
         side, entry, tp_px, sl_px = pos["side"], pos["entry"], pos["tp_price"], pos["sl_price"]
 
-        # 1. Cek TP / SL terlebih dahulu
         if side == "LONG":
             if px >= tp_px: live_close(sym, "TP", px); continue
             if px <= sl_px: live_close(sym, "SL", px); continue
-            is_in_loss = px < entry
+            is_minus = px < entry
+            is_profit = px > entry
         elif side == "SHORT":
             if px <= tp_px: live_close(sym, "TP", px); continue
             if px >= sl_px: live_close(sym, "SL", px); continue
-            is_in_loss = px > entry
+            is_minus = px > entry
+            is_profit = px < entry
         else:
             continue
 
-        # 2. Cek Time Limit Minus (reset otomatis begitu berbalik ke area profit / >= entry)
-        if is_in_loss:
-            if pos.get("loss_start_ts") is None:
-                pos["loss_start_ts"] = now
-            elif (now - pos["loss_start_ts"]) >= LOSS_HOLD_LIMIT_SEC:
-                live_close(sym, "LOSS_1H_LIMIT", px)
+        # Reset timer minus otomatis jika posisi sudah kembali masuk area profit (+)
+        if is_profit:
+            if pos.get("minus_since") is not None:
+                pos["minus_since"] = None
+        elif is_minus:
+            if pos.get("minus_since") is None:
+                pos["minus_since"] = now
+            elif (now - pos["minus_since"]) >= MINUS_HOLD_LIMIT_SEC:
+                live_close(sym, "MINUS_1H", px)
                 continue
-        else:
-            if pos.get("loss_start_ts") is not None:
-                pos["loss_start_ts"] = None
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SCANNER THREAD & STRICT FILTERS
@@ -1429,7 +1431,7 @@ def print_inline():
     acc_mode = _get_acc_mode_str()
     engine_label = "PAPER ENGINE" if PAPER_TRADING else "API ENGINE"
     print(f"        ┌ [{engine_label} v23.3 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
-    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Cut1H:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
+    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Minus1H:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1445,10 +1447,10 @@ def print_full():
     print(f"\n  {'─'*72}")
     print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD ({acc_mode} | MODE: {mode_str}{forced_str}){failed_str} [{now_wita}]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
-    print(f"    💰 Margin:${ORDER_USDT:.2f} | TP:+{tp_u:.2f}U | SL:-{sl_u:.2f}U per trade | LossLimit:1H")
+    print(f"    💰 Margin:${ORDER_USDT:.2f} | TP:+{tp_u:.2f}U | SL:-{sl_u:.2f}U per trade")
     print(f"    PnL Net:{pnl:+.5f}U | Weekly PnL:{_weekly_pnl:+.5f}U / Target:${ORDER_USDT:.2f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    🏆 Best Win:{_stats['best']:+.5f}U | 💥 Worst Loss:{_stats['worst']:+.5f}U")
-    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | Cut1H:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
+    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | Minus1H:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
 
     if trade_log:
         print(f"    {'─'*68}\n    📋 Last 5 Trades (Makassar / WITA Timezone):")
@@ -1457,7 +1459,7 @@ def print_full():
             in_t = t.get("in_wita", "--:--:--")
             out_t = t.get("out_wita", "--:--:--")
             mode_lbl = f"[{t.get('mode', 'NORMAL')}]"
-            print(f"        {em} {t['sym']:<12} {t['side']:<5} {mode_lbl:<10} {t['pnl']:+.5f}U (G:{t.get('gross', 0.0):+.4f}{'*' if t.get('est') else ''}) {t['hold']}s — {t['reason']:<13} | In:{in_t} Out:{out_t}")
+            print(f"        {em} {t['sym']:<12} {t['side']:<5} {mode_lbl:<10} {t['pnl']:+.5f}U (G:{t.get('gross', 0.0):+.4f}{'*' if t.get('est') else ''}) {t['hold']}s — {t['reason']:<11} | In:{in_t} Out:{out_t}")
     print(f"  {'─'*72}")
 
 def t_monitor():
@@ -1615,7 +1617,7 @@ def run_bot():
     print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
     print("║  3. Inverted Lock Engine (SHORT loss -> LONG, LONG loss -> SHORT)  ║")
     print(f"║  4. Target Mingguan = ${ORDER_USDT:.2f} (sama dengan margin) | Reset Senin WITA  ║")
-    print(f"║  5. Margin=${ORDER_USDT:.2f} | TP=+${tp_u:.2f} | SL=-${sl_u:.2f} | Cut Minus > 1 Jam      ║")
+    print(f"║  5. Margin=${ORDER_USDT:.2f} | TP=+${tp_u:.2f} | SL=-${sl_u:.2f} | Cut Minus >1j (reset+) ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     
     try:
