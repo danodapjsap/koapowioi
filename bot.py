@@ -1,7 +1,7 @@
 """
 Bot Scalping v23.7 — BINANCE FUTURES PAPER TRADING / LIVE & DEMO EXECUTION ENGINE
 ====================================================================
-UPDATES v23.7 (PAPER TRADING):
+UPDATES v23.7 (PAPER TRADING)
 - PAPER_TRADING = True: TIDAK ADA order yang dikirim ke Binance (termasuk testnet). Entry & exit disimulasikan
   lokal di harga live + slippage, PnL dihitung dengan fee taker (FEE_RATE) di kedua sisi.
 - Data pasar (klines, depth, mark price, ticker, BTC aggTrade) tetap diambil LIVE dari Binance MAINNET.
